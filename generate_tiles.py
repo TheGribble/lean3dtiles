@@ -16,7 +16,7 @@ import trimesh
 A = 6378137.0
 F = 1 / 298.257223563
 E2 = F * (2 - F)
-COLS, ROWS = 64, 32  # cells per tile
+COLS, ROWS = 704, 352  # cells per tile (set from --cols)
 
 
 def ecef(lat, lon, h):
@@ -103,10 +103,14 @@ def main():
     ap.add_argument("--dem", required=True)
     ap.add_argument("--land", required=True)
     ap.add_argument("--max-level", type=int, default=5)
+    ap.add_argument("--cols", type=int, default=704, help="grid cells per tile along longitude (rows = cols/2)")
     ap.add_argument("--out", default="output/terrain_tiles")
     ap.add_argument("--sea-offset", type=float, default=4.0, help="metres the sea sits below 0 to avoid z-fighting with the coast")
     a = ap.parse_args()
     N = a.max_level
+    global COLS, ROWS
+    COLS, ROWS = a.cols, a.cols // 2
+    print(f"{COLS}x{ROWS} cells/tile, levels 0..{N}, finest cell {360 / (COLS * 2 ** N):.4f} deg")
     os.makedirs(os.path.join(a.out, "tiles"), exist_ok=True)
 
     print("Loading land polygons...")
@@ -162,7 +166,19 @@ def main():
         dl = 360.0 / (COLS * 2 ** L)
         w0, s0 = -180 + tx * COLS * dl, -90 + ty * ROWS * dl
         has_land = shapely.intersects(land, shapely.box(w0, s0, w0 + COLS * dl, s0 + ROWS * dl))
-        P, Nn, M, H, lat, lon = lattice(L, tx, ty, has_land)
+        smult = 1
+        if has_land:
+            P, Nn, M, H, lat, lon = lattice(L, tx, ty, has_land)
+        else:
+            # pure ocean: flat sea needs only a coarse grid (64 cells across)
+            smult = max(COLS // 64, 1)
+            ix = tx * COLS + np.arange(0, COLS + 1, smult)
+            iy = ty * ROWS + np.arange(0, ROWS + 1, smult)
+            lon, lat = np.meshgrid(-180 + ix * dl, -90 + iy * dl)
+            P = ecef(np.radians(lat), np.radians(lon), 0.0)
+            Nn = P / np.linalg.norm(P, axis=-1, keepdims=True)
+            M = np.zeros(lat.shape, bool)
+            H = np.zeros(lat.shape)
 
         a_, b_ = M[:-1, :-1], M[:-1, 1:]
         c_, d_ = M[1:, :-1], M[1:, 1:]
@@ -177,7 +193,7 @@ def main():
         tile = {}
         w, e = math.radians(lon.min()), math.radians(lon.max())
         s, n = math.radians(lat.min()), math.radians(lat.max())
-        step = math.radians(360 / (COLS * 2 ** L))
+        step = math.radians(360 / (COLS * 2 ** L)) * smult
         meshes = []
         hmin, hmax = 0.0, 0.0
         R, C = P.shape[:2]

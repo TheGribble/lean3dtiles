@@ -14,6 +14,7 @@ const io = new NodeIO().registerExtensions([KHRDracoMeshCompression]).registerDe
   'draco3d.decoder': await draco3d.createDecoderModule(),
   'draco3d.encoder': await draco3d.createEncoderModule(),
 });
+fs.mkdirSync(outDir, { recursive: true });
 const files = fs.readdirSync(dir).filter((f) => f.endsWith('.glb'));
 let before = 0, after = 0, i = 0;
 for (const f of files) {
