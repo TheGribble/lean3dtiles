@@ -3,7 +3,7 @@
 Builds a global, land + sea terrain **3D Tiles 1.1** tileset (Draco-compressed GLB tiles,
 green elevation-graded land, flat blue sea) for CesiumJS / Cesium for Unity.
 
-The built tileset is in `output/terrain_tiles/` (~457 MB, 1,189 tiles, 6 levels, ~1.8 km finest cells,
+The built tileset is in `output/terrain_tiles/` (~464 MB, 1,189 tiles, 6 levels, ~1.8 km finest cells,
 matching ETOPO1's native resolution). Each tile is a 704x352-cell grid, so few levels are needed.
 
 ## Rebuild
@@ -27,6 +27,10 @@ matching ETOPO1's native resolution). Each tile is a 704x352-cell grid, so few l
 
 ## Notes
 
+- Coastlines are cut *exactly* against the Natural Earth 10m land polygon: cells the coast crosses are clipped and
+  re-triangulated, so waterways narrower than a grid cell (e.g. the Solent, Southampton Water) stay open.
+  Heights are clamped to >= 0; the sea is a flat mesh 4 m below that (`--sea-offset`).
+  `--bbox w s e n` builds only that area in detail (for quick tests).
 - Draco-compressed normalised-uint8 `COLOR_0` renders red/garbled in CesiumJS, so `compress.mjs`
   converts colours to float first.
 - Terrain heights come from ETOPO1 (~1.8 km); finer tiles need a finer DEM.

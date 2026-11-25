@@ -1,10 +1,12 @@
-"""Build a land-only global terrain 3D Tileset (3D Tiles 1.1, GLB content).
+"""Build a global land + sea terrain 3D Tileset (3D Tiles 1.1, GLB content).
 
-Quadtree over lon/lat. Tile (L, x, y) spans 360/2^L deg lon by 180/2^L deg lat
-and is a 64x32-cell grid, so grid spacing halves each level and every coarse
-lattice is a subset of the finest lattice (consistent shared vertices).
-Triangles are kept if at least one corner is on land; heights are clamped >= 0
-so coastal triangles don't dip into the bathymetry.
+Quadtree over lon/lat. Tile (L, x, y) spans 360/2^L deg lon by 180/2^L deg lat and is a
+COLS x ROWS cell grid, so grid spacing halves each level.
+
+Land: cells wholly inland use the regular lattice. Cells touched by the coastline are
+cut *exactly* against the land polygon and re-triangulated (constrained Delaunay), so
+coasts and waterways narrower than a cell are represented correctly. Heights are
+clamped >= 0. Sea: a flat mesh a few metres below 0 under every coastal cell.
 """
 import argparse, json, math, os
 import numpy as np
@@ -103,6 +105,7 @@ def main():
     ap.add_argument("--dem", required=True)
     ap.add_argument("--land", required=True)
     ap.add_argument("--max-level", type=int, default=5)
+    ap.add_argument("--bbox", type=float, nargs=4, default=None, help="test only: w s e n; tiles outside are coarse sea")
     ap.add_argument("--cols", type=int, default=704, help="grid cells per tile along longitude (rows = cols/2)")
     ap.add_argument("--out", default="output/terrain_tiles")
     ap.add_argument("--sea-offset", type=float, default=4.0, help="metres the sea sits below 0 to avoid z-fighting with the coast")
@@ -117,127 +120,157 @@ def main():
     land = shapely.union_all(gpd.read_file(a.land).geometry.values)
     shapely.prepare(land)
 
-    # Coastline segments for snapping ocean-side vertices onto the real coast.
-    parts = shapely.get_parts(shapely.boundary(land))
-    xy, pi = shapely.get_coordinates(parts, return_index=True)
-    ok = pi[:-1] == pi[1:]
-    SA, SB = xy[:-1][ok], xy[1:][ok]
-    tree = shapely.STRtree(shapely.linestrings(np.stack([SA, SB], 1)))
-
-    def snap_to_coast(lon, lat):
-        pts = np.stack([lon, lat], -1)
-        _, ti = tree.query_nearest(shapely.points(pts), all_matches=False)
-        A_, B_ = SA[ti], SB[ti]
-        ab = B_ - A_
-        t = np.clip(((pts - A_) * ab).sum(1) / np.maximum((ab ** 2).sum(1), 1e-18), 0, 1)
-        q = A_ + ab * t[:, None]
-        return q[:, 0], q[:, 1]
-
     print("Loading DEM...")
     with rasterio.open(a.dem) as src:
         dem = (src.read(1).astype(np.float32), src.transform)
 
-    def lattice(L, tx, ty, check_land=True):
-        """Per-tile lattice with a 1-cell pad (for seamless normals)."""
-        nx = COLS * 2 ** L
-        dl = 360.0 / nx
-        ix = np.arange(tx * COLS - 1, tx * COLS + COLS + 2)
-        iy = np.arange(ty * ROWS - 1, ty * ROWS + ROWS + 2)
-        LON, LAT = np.meshgrid(-180 + ix * dl, -90 + iy * dl)
-        h = np.maximum(sample_dem(dem, LAT, LON), 0)
-        onland = shapely.intersects_xy(land, LON, LAT) if check_land else np.zeros(LON.shape, bool)
-        P = ecef(np.radians(LAT), np.radians(LON), h)
-        du = np.gradient(P, axis=1)
-        dv = np.gradient(P, axis=0)
-        Nrm = np.cross(du, dv)
-        ln = np.linalg.norm(Nrm, axis=-1, keepdims=True)
-        rad = P / np.linalg.norm(P, axis=-1, keepdims=True)
-        Nrm = np.where(ln > 1e-3, Nrm / np.maximum(ln, 1e-12), rad)
-        Nrm[np.abs(LAT) > 89.99] = rad[np.abs(LAT) > 89.99]
-        c = (slice(1, -1), slice(1, -1))
-        return P[c], Nrm[c], onland[c], h[c], LAT[c], LON[c]
-
     nfiles = 0
     total_bytes = 0
+    EPS = 1e-9
+
+    def vertex_normals(lat, lon, h, d):
+        """Normals from DEM central differences (a pure function of lon/lat, so seamless)."""
+        def pos(la, lo):
+            return ecef(np.radians(la), np.radians(lo), np.maximum(sample_dem(dem, la, lo), 0))
+        n = np.cross(pos(lat, lon + d) - pos(lat, lon - d), pos(lat + d, lon) - pos(lat - d, lon))
+        ln = np.linalg.norm(n, axis=1, keepdims=True)
+        rad = ecef(np.radians(lat), np.radians(lon), h)
+        rad /= np.linalg.norm(rad, axis=1, keepdims=True)
+        return np.where((ln > 1e-3) & (np.abs(lat)[:, None] < 89.9), n / np.maximum(ln, 1e-12), rad)
+
+    def land_mesh(lon, lat, dl, tl, step):
+        """Returns (pos, nor, rgba, faces, hmin, hmax, cellclass) for the land of one tile."""
+        R, C = lon.shape
+        M = shapely.intersects_xy(tl, lon, lat)
+        a_, b_, c_, d_ = M[:-1, :-1], M[:-1, 1:], M[1:, :-1], M[1:, 1:]
+        allland = a_ & b_ & c_ & d_
+        anyland = a_ | b_ | c_ | d_
+        # cells crossed by the coastline: densify the boundary and mark the cells its points fall in
+        touched = np.zeros(allland.shape, bool)
+        bpts = shapely.get_coordinates(shapely.segmentize(shapely.boundary(tl), dl * 0.5))
+        if len(bpts):
+            ci = np.floor((bpts[:, 0] - lon[0, 0]) / dl).astype(int)
+            cj = np.floor((bpts[:, 1] - lat[0, 0]) / dl).astype(int)
+            ok = (ci >= 0) & (ci < allland.shape[1]) & (cj >= 0) & (cj < allland.shape[0])
+            touched[cj[ok], ci[ok]] = True
+            t = touched.copy()
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    ys = slice(max(dy, 0), allland.shape[0] + min(dy, 0))
+                    yd = slice(max(-dy, 0), allland.shape[0] + min(-dy, 0))
+                    xs = slice(max(dx, 0), allland.shape[1] + min(dx, 0))
+                    xd = slice(max(-dx, 0), allland.shape[1] + min(-dx, 0))
+                    t[yd, xd] |= touched[ys, xs]
+            touched = t
+        full = allland & ~touched
+        clip = (anyland | touched) & ~full
+
+        tris = []
+        if full.any():
+            la = np.stack([lon, lat], -1)
+            ia, ib = la[:-1, :-1][full], la[:-1, 1:][full]
+            ic, id_ = la[1:, :-1][full], la[1:, 1:][full]
+            tris.append(np.stack([ia, ib, ic], 1))
+            tris.append(np.stack([ib, id_, ic], 1))
+        if clip.any():
+            boxes = shapely.box(lon[:-1, :-1][clip], lat[:-1, :-1][clip], lon[1:, 1:][clip], lat[1:, 1:][clip])
+            inter = shapely.intersection(shapely.union_all(boxes), tl)
+            polys = [g for g in shapely.get_parts(inter) if shapely.get_type_id(g) == 3]
+            if polys:
+                parts = shapely.get_parts(shapely.constrained_delaunay_triangles(np.array(polys, dtype=object)))
+                parts = [g for g in parts if shapely.get_type_id(g) == 3]
+                xy = shapely.get_coordinates(np.array(parts, dtype=object)).reshape(-1, 4, 2)[:, :3]
+                tris.append(xy)
+        if not tris:
+            return None, allland, touched
+        T = np.concatenate(tris)
+        # outward-facing = counter-clockwise in lon/lat; drop degenerate triangles
+        sa = 0.5 * ((T[:, 1, 0] - T[:, 0, 0]) * (T[:, 2, 1] - T[:, 0, 1]) - (T[:, 2, 0] - T[:, 0, 0]) * (T[:, 1, 1] - T[:, 0, 1]))
+        keep = np.abs(sa) > 1e-16
+        T, sa = T[keep], sa[keep]
+        neg = sa < 0
+        T[neg] = T[neg][:, ::-1]
+        keys = np.round(T.reshape(-1, 2) / EPS).astype(np.int64)
+        _, first, inv = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+        vxy = T.reshape(-1, 2)[first]
+        faces = inv.reshape(-1, 3)
+        vlon, vlat = vxy[:, 0], vxy[:, 1]
+        vh = np.maximum(sample_dem(dem, vlat, vlon), 0)
+        # skirts on mesh-border edges that lie on the tile perimeter
+        e = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+        ek = np.minimum(e[:, 0], e[:, 1]) * len(vxy) + np.maximum(e[:, 0], e[:, 1])
+        _, einv, ecnt = np.unique(ek, return_inverse=True, return_counts=True)
+        be = e[ecnt[einv] == 1]
+        w0, e0, s0, n0 = lon[0, 0], lon[0, -1], lat[0, 0], lat[-1, 0]
+        def onb(v, val, axis):
+            return np.abs((vlon if axis == 0 else vlat)[v] - val) < 1e-7
+        edge_on = np.zeros(len(be), bool)
+        for val, axis in ((w0, 0), (e0, 0), (s0, 1), (n0, 1)):
+            edge_on |= onb(be[:, 0], val, axis) & onb(be[:, 1], val, axis)
+        be = be[edge_on]
+        V = len(vxy)
+        skirt = step * A * 0.5
+        if len(be):
+            sk = np.concatenate([np.stack([be[:, 0], be[:, 0] + V, be[:, 1]], 1),
+                                 np.stack([be[:, 1], be[:, 0] + V, be[:, 1] + V], 1)])
+            faces = np.concatenate([faces, sk])
+        P = ecef(np.radians(vlat), np.radians(vlon), vh)
+        Pd = ecef(np.radians(vlat), np.radians(vlon), vh - skirt)
+        Nn = vertex_normals(vlat, vlon, vh, dl * 0.5)
+        pos, nor, col, fcs = compact(np.concatenate([P, Pd]), np.concatenate([Nn, Nn]),
+                                     np.concatenate([vh, vh]), faces, None)
+        return (pos, nor, col, fcs, float(vh.min()) - skirt, float(vh.max())), allland, touched
 
     def build_tile(L, tx, ty):
-        """Returns (tile json dict, has_content) or None if no land at all below."""
+        """Returns the tile json dict (with private _h = (hmin, hmax))."""
         nonlocal nfiles, total_bytes
         dl = 360.0 / (COLS * 2 ** L)
         w0, s0 = -180 + tx * COLS * dl, -90 + ty * ROWS * dl
-        has_land = shapely.intersects(land, shapely.box(w0, s0, w0 + COLS * dl, s0 + ROWS * dl))
+        e0, n0 = w0 + COLS * dl, s0 + ROWS * dl
+        tb = shapely.box(w0, s0, e0, n0)
+        has_land = shapely.intersects(land, tb) and (a.bbox is None or shapely.intersects(tb, shapely.box(*a.bbox)))
         smult = 1
         if has_land:
-            P, Nn, M, H, lat, lon = lattice(L, tx, ty, has_land)
+            ix = tx * COLS + np.arange(COLS + 1)
+            iy = ty * ROWS + np.arange(ROWS + 1)
         else:
             # pure ocean: flat sea needs only a coarse grid (64 cells across)
             smult = max(COLS // 64, 1)
             ix = tx * COLS + np.arange(0, COLS + 1, smult)
             iy = ty * ROWS + np.arange(0, ROWS + 1, smult)
-            lon, lat = np.meshgrid(-180 + ix * dl, -90 + iy * dl)
-            P = ecef(np.radians(lat), np.radians(lon), 0.0)
-            Nn = P / np.linalg.norm(P, axis=-1, keepdims=True)
-            M = np.zeros(lat.shape, bool)
-            H = np.zeros(lat.shape)
+        lon, lat = np.meshgrid(-180 + ix * dl, -90 + iy * dl)
 
-        a_, b_ = M[:-1, :-1], M[:-1, 1:]
-        c_, d_ = M[1:, :-1], M[1:, 1:]
-        t1 = a_ | b_ | c_   # (a,b,c)
-        t2 = b_ | d_ | c_   # (b,d,c)
         children = []
         if L < N and has_land:   # pure-ocean tiles stay leaves (flat sea needs no refinement)
             for cy in (2 * ty, 2 * ty + 1):
                 for cx in (2 * tx, 2 * tx + 1):
                     children.append(build_tile(L + 1, cx, cy))
 
-        tile = {}
-        w, e = math.radians(lon.min()), math.radians(lon.max())
-        s, n = math.radians(lat.min()), math.radians(lat.max())
-        step = math.radians(360 / (COLS * 2 ** L)) * smult
-        meshes = []
-        hmin, hmax = 0.0, 0.0
-        R, C = P.shape[:2]
-        if t1.any() or t2.any():
-            idx = np.arange(R * C).reshape(R, C)
-            ia, ib, ic, id_ = idx[:-1, :-1], idx[:-1, 1:], idx[1:, :-1], idx[1:, 1:]
-            faces = np.concatenate([
-                np.stack([ia[t1], ib[t1], ic[t1]], -1),
-                np.stack([ib[t2], id_[t2], ic[t2]], -1)])
+        step = math.radians(dl) * smult
+        R, C = lon.shape
+        meshes, hmin, hmax = [], 0.0, 0.0
+        allland = np.zeros((R - 1, C - 1), bool)
+        touched = np.zeros((R - 1, C - 1), bool)
+        if has_land:
+            pad = 2 * dl
+            tl = shapely.clip_by_rect(land, w0 - pad, s0 - pad, e0 + pad, n0 + pad)
+            tl = shapely.simplify(tl, dl * 0.1, preserve_topology=True)
+            shapely.prepare(tl)
+            res, allland, touched = land_mesh(lon, lat, dl, tl, step)
+            if res is not None:
+                meshes.append(res[:4])
+                hmin, hmax = res[4], res[5]
 
-            # snap ocean-side vertices of coastal triangles onto the coastline
-            lat_f, lon_f, h_f = lat.reshape(-1).copy(), lon.reshape(-1).copy(), H.reshape(-1).copy()
-            P_f = P.reshape(-1, 3).copy()
-            wet = np.unique(faces)
-            wet = wet[~M.reshape(-1)[wet]]
-            if len(wet):
-                nlon, nlat = snap_to_coast(lon_f[wet], lat_f[wet])
-                nh = np.maximum(sample_dem(dem, nlat, nlon), 0)
-                lon_f[wet], lat_f[wet], h_f[wet] = nlon, nlat, nh
-                P_f[wet] = ecef(np.radians(nlat), np.radians(nlon), nh)
-
-            # skirts along the tile perimeter hide cracks between LOD levels
-            skirt = step * A * 0.5
-            P_dn = ecef(np.radians(lat_f), np.radians(lon_f), h_f - skirt)
-            sk = skirt_faces(t1 | t2, idx, R * C)
-            if len(sk):
-                faces = np.concatenate([faces, sk])
-
-            allP = np.concatenate([P_f, P_dn])
-            allN = np.concatenate([Nn.reshape(-1, 3)] * 2)
-            allH = np.concatenate([h_f, h_f])
-            meshes.append(compact(allP, allN, allH, faces, None))
-            hmin, hmax = float(h_f.min()) - skirt, float(h_f.max())
-
-        # sea: every cell with at least one non-land corner (coastal cells included,
-        # so the coast has no gaps); a few metres below 0 to avoid z-fighting.
+        # sea: every cell that is not wholly inland or that the coastline crosses
+        # (a few metres below 0 so it never z-fights with the coast)
         sea_h = -a.sea_offset
         sskirt = step * A * 0.5
-        sea_keep = ~(a_ & b_ & c_ & d_)
+        sea_keep = ~allland | touched
         if sea_keep.any():
-            SP = ecef(np.radians(lat), np.radians(lon), sea_h).reshape(-1, 3)
-            SPd = ecef(np.radians(lat), np.radians(lon), sea_h - sskirt).reshape(-1, 3)
             idx = np.arange(R * C).reshape(R, C)
             ia, ib, ic, id_ = idx[:-1, :-1], idx[:-1, 1:], idx[1:, :-1], idx[1:, 1:]
+            SP = ecef(np.radians(lat), np.radians(lon), sea_h).reshape(-1, 3)
+            SPd = ecef(np.radians(lat), np.radians(lon), sea_h - sskirt).reshape(-1, 3)
             sf = np.concatenate([np.stack([ia[sea_keep], ib[sea_keep], ic[sea_keep]], -1),
                                  np.stack([ib[sea_keep], id_[sea_keep], ic[sea_keep]], -1),
                                  skirt_faces(sea_keep, idx, R * C)])
@@ -245,6 +278,8 @@ def main():
             allSN = allSP / np.linalg.norm(allSP, axis=1, keepdims=True)
             meshes.append(compact(allSP, allSN, None, sf, SEA_RGBA))
             hmin = min(hmin, sea_h - sskirt)
+
+        tile = {}
         if meshes:
             allpos = np.concatenate([m[0] for m in meshes])
             center = allpos.mean(0)
@@ -266,8 +301,8 @@ def main():
             tile["content"] = {"uri": f"tiles/{name}"}
         for c in children:
             hmin = min(hmin, c["_h"][0]); hmax = max(hmax, c["_h"][1])
-        # pad by the lattice step so the bounds cover the coarse-vs-fine surface
-        tile["boundingVolume"] = {"region": [w, s, e, n, hmin - 100, hmax + 100]}
+        tile["boundingVolume"] = {"region": [math.radians(w0), math.radians(s0), math.radians(e0), math.radians(n0),
+                                             hmin - 100, hmax + 100]}
         tile["geometricError"] = step * A if children else 0
         if children:
             tile["children"] = [{k: v for k, v in c.items() if k != "_h"} for c in children]
