@@ -1,0 +1,3 @@
+{ "name": "tilebuilder", "private": true, "type": "module",
+  "dependencies": { "@gltf-transform/core": "^4", "@gltf-transform/extensions": "^4",
+                    "@gltf-transform/functions": "^4", "draco3dgltf": "^1.5.7" } }

@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Terrain tiles</title>
+<script src="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Cesium.js"></script>
+<link href="https://cesium.com/downloads/cesiumjs/releases/1.124/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+<style>html,body,#c{margin:0;width:100%;height:100%}</style></head>
+<body><div id="c"></div><script>
+const viewer = new Cesium.Viewer("c", {baseLayer:false, baseLayerPicker:false, geocoder:false, animation:false, timeline:false});
+viewer.scene.globe.show = false;
+viewer.scene.globe.baseColor = Cesium.Color.DARKSLATEGRAY;
+viewer.scene.backgroundColor = Cesium.Color.BLACK;
+Cesium.Cesium3DTileset.fromUrl("tileset.json").then(ts => {
+  ts.maximumScreenSpaceError = 1;  // default 16 px shows coarse blocks; cells are ~1px at max level
+  ts.skipLevelOfDetail = false;
+  viewer.scene.primitives.add(ts); viewer.zoomTo(ts);
+  window.ts = ts;
+}).catch(console.error);
+</script></body></html>
